@@ -3,9 +3,9 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(watcher_disable)");
 
     // Disable the watcher if:
-    // 1. We're not on Linux (inotify is Linux-only)
+    // 1. We're not on a supported platform (Linux inotify or macOS FSEvents)
     // 2. The FILESENTRY_DISABLE environment variable is set (for testing)
-    let disable = !cfg!(target_os = "linux")
+    let disable = !(cfg!(target_os = "linux") || cfg!(target_os = "macos"))
         || std::env::var("FILESENTRY_DISABLE").is_ok();
 
     if disable {

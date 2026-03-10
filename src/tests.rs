@@ -18,6 +18,7 @@ static TIMEOUT: LazyLock<Duration> =
         _ => Duration::from_secs(20),
     });
 
+#[cfg(target_os = "linux")]
 pub static READ_DELAY: LazyLock<Duration> =
     LazyLock::new(|| match std::env::var("FILESENTRY_READ_DELAY") {
         Ok(res) if !res.trim().is_empty() => Duration::from_millis(
@@ -110,6 +111,7 @@ fn init_watcher() -> (TempDir, Watcher) {
     init_watcher_imp(false)
 }
 
+#[cfg(target_os = "linux")]
 fn init_watcher_slow() -> (TempDir, Watcher) {
     init_watcher_imp(true)
 }
@@ -131,10 +133,14 @@ fn init_watcher_imp(slow: bool) -> (TempDir, Watcher) {
 fn with_watcher(f: impl FnOnce(&Path, &Watcher)) {
     let (dir, watcher) = init_watcher();
     let shutdown_guard = watcher.shutdown_guard();
-    f(dir.path(), &watcher);
+    // Canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
+    // so assertion paths match the canonical paths used internally.
+    let canonical = dir.path().canonicalize().unwrap();
+    f(&canonical, &watcher);
     drop(shutdown_guard)
 }
 
+#[cfg(target_os = "linux")]
 fn with_watcher_slow(f: impl FnOnce(&Path, &Watcher)) {
     let (dir, watcher) = init_watcher_slow();
     let shutdown_guard = watcher.shutdown_guard();
@@ -217,6 +223,7 @@ fn modify() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn queue_overflow() {
     with_watcher_slow(|dir, watcher| {
         let files: Vec<_> = (0..20_0000)

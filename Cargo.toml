@@ -20,15 +20,17 @@ walkdir = "2.3.3"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0.7", features = ["fs"] }
 
+# Linux + macOS (pending.rs uses bitflags on both platforms)
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+bitflags = "2.9.0"
+
 # Linux-only (inotify module)
 [target.'cfg(target_os = "linux")'.dependencies]
-bitflags = "2.9.0"
 papaya = "0.2.1"
 mio = { version = "1.0.4", features = ["os-ext"] }
-ignore = "0.4.23"
-
 
 [dev-dependencies]
+ignore = "0.4.23"
 tempfile = "3.20.0"
 pretty_assertions = "1.4.1"
 env_logger = "0.11.8"

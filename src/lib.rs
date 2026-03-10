@@ -14,8 +14,10 @@ use crate::config::Config;
 #[cfg(not(watcher_disable))]
 use crate::events::EventDebouncer;
 pub use crate::events::{Event, EventType, Events};
-#[cfg(not(watcher_disable))]
-use crate::inotify::InotifyWatcher;
+#[cfg(all(not(watcher_disable), target_os = "linux"))]
+use crate::inotify::InotifyWatcher as PlatformWatcher;
+#[cfg(all(not(watcher_disable), target_os = "macos"))]
+use crate::fsevent::FseventWatcher as PlatformWatcher;
 pub use crate::path::{CannonicalPath, CanonicalPathBuf};
 pub use config::Filter;
 
@@ -25,8 +27,10 @@ mod metadata;
 mod path;
 
 // These modules require the full Watcher implementation
-#[cfg(not(watcher_disable))]
+#[cfg(all(not(watcher_disable), target_os = "linux"))]
 mod inotify;
+#[cfg(all(not(watcher_disable), target_os = "macos"))]
+mod fsevent;
 #[cfg(not(watcher_disable))]
 mod pending;
 #[cfg(not(watcher_disable))]
@@ -70,7 +74,7 @@ struct WatcherState {
 
 #[cfg(not(watcher_disable))]
 pub struct ShutdownOnDrop {
-    watcher: Weak<InotifyWatcher>,
+    watcher: Weak<PlatformWatcher>,
 }
 
 #[cfg(not(watcher_disable))]
@@ -102,7 +106,7 @@ impl ShutdownOnDrop {
 #[derive(Debug, Clone)]
 pub struct Watcher {
     state: Arc<WatcherState>,
-    notify: Arc<InotifyWatcher>,
+    notify: Arc<PlatformWatcher>,
 }
 
 #[cfg(not(watcher_disable))]
@@ -197,9 +201,9 @@ impl Watcher {
             recrawls: AtomicUsize::new(0),
         });
         #[cfg(test)]
-        let watcher = InotifyWatcher::new(_slow, state.clone())?;
+        let watcher = PlatformWatcher::new(_slow, state.clone())?;
         #[cfg(not(test))]
-        let watcher = InotifyWatcher::new(state.clone())?;
+        let watcher = PlatformWatcher::new(state.clone())?;
 
         Ok(Self {
             state,
