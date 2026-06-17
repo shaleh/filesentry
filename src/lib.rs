@@ -121,6 +121,11 @@ impl Watcher {
         self.notify.empty_iterations()
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub fn inject_rescan(&self) {
+        self.notify.inject_rescan();
+    }
+
     pub fn shutdown(&self) {
         self.notify.shutdown();
     }

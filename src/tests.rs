@@ -244,9 +244,11 @@ fn no_busy_loop_without_roots() {
 
 // macOS has no slow-read knob to force a queue overflow on demand the way the
 // inotify path does. This hammers the watcher with many files at once and
-// asserts not a single create is lost, whether FSEvents delivers them directly
-// or coalesces into a MUST_SCAN_SUB_DIRS recrawl. It is the macOS stand-in for
-// queue_overflow.
+// asserts not a single create is lost. In practice it runs with zero recrawls
+// because FSEvents absorbs the burst, so it does not actually exercise the
+// MUST_SCAN_SUB_DIRS recrawl branch. That branch is driven directly by
+// synthetic_rescan_does_not_duplicate instead. This stays as the macOS
+// stand-in for queue_overflow under realistic load.
 #[test]
 #[cfg(target_os = "macos")]
 fn bulk_create_no_lost_events() {
@@ -295,6 +297,39 @@ fn rapid_modify_of_existing_file() {
         write(dir, "a", "v3");
         write(dir, "a", "v4");
         assertion.check();
+    });
+}
+
+// The MUST_SCAN_SUB_DIRS recrawl branch only fires when the FSEvents kernel
+// buffer overflows, which bulk_create_no_lost_events shows we cannot provoke on
+// demand. inject_rescan drives that exact branch so the recrawl path is
+// actually exercised on macOS. A forced rescan clears pending changes and
+// suppresses direct adds until the worker consumes it, so the create of d is
+// rediscovered by the crawl itself. The exact-match assertion also catches the
+// recrawl wrongly re-reporting files the tree already knows.
+#[test]
+#[cfg(target_os = "macos")]
+fn synthetic_rescan_does_not_duplicate() {
+    with_watcher(|dir, watcher| {
+        let assertion = Assertion::new(
+            watcher,
+            dir,
+            [
+                ("a", EventType::Create),
+                ("b", EventType::Create),
+                ("c", EventType::Create),
+            ],
+        );
+        write(dir, "a", "1");
+        write(dir, "b", "1");
+        write(dir, "c", "1");
+        assertion.check();
+
+        let assertion = Assertion::new(watcher, dir, [("d", EventType::Create)]);
+        watcher.inject_rescan();
+        write(dir, "d", "1");
+        assertion.check();
+        assert!(watcher.recrawls() >= 1, "expected the injected rescan to recrawl");
     });
 }
 

@@ -59,6 +59,15 @@ impl FseventWatcher {
             .load(atomic::Ordering::Relaxed)
     }
 
+    // Mimics an FSEvents MUST_SCAN_SUB_DIRS notification. The kernel only sends
+    // that when its event buffer overflows, which a test cannot trigger on
+    // demand, so this drives the same recrawl path directly.
+    #[cfg(test)]
+    pub(crate) fn inject_rescan(&self) {
+        self.changes.lock().recrawl();
+        self.changes.notify();
+    }
+
     pub fn new(
         #[cfg(test)] _slow: bool,
         state: Arc<WatcherState>,
