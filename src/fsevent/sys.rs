@@ -1,12 +1,18 @@
 use std::ffi::{c_char, c_double, c_void, CStr};
 use std::ptr;
 use std::sync::atomic::{self, AtomicBool, AtomicU64};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Condvar, Mutex};
 
 // Core Foundation types
 #[repr(C)]
 pub struct __CFRunLoop(c_void);
 pub type CFRunLoopRef = *mut __CFRunLoop;
+
+#[repr(C)]
+pub struct __CFRunLoopSource(c_void);
+pub type CFRunLoopSourceRef = *mut __CFRunLoopSource;
 
 #[repr(C)]
 pub struct __CFAllocator(c_void);
@@ -59,6 +65,23 @@ pub struct CFArrayCallBacks {
     pub equal: *const c_void,
 }
 
+// CFRunLoopSourceContext for a version 0 source. Only the perform callback is
+// set. The source is never signaled. It exists so the run loop always has an
+// input source and CFRunLoopRun blocks instead of returning immediately.
+#[repr(C)]
+pub struct CFRunLoopSourceContext {
+    pub version: CFIndex,
+    pub info: *mut c_void,
+    pub retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    pub release: Option<extern "C" fn(*const c_void)>,
+    pub copy_description: Option<extern "C" fn(*const c_void) -> CFStringRef>,
+    pub equal: Option<extern "C" fn(*const c_void, *const c_void) -> u8>,
+    pub hash: Option<extern "C" fn(*const c_void) -> usize>,
+    pub schedule: Option<extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
+    pub cancel: Option<extern "C" fn(*mut c_void, CFRunLoopRef, CFStringRef)>,
+    pub perform: Option<extern "C" fn(*mut c_void)>,
+}
+
 // FSEventStreamContext
 #[repr(C)]
 pub struct FSEventStreamContext {
@@ -86,6 +109,17 @@ extern "C" {
     pub fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     pub fn CFRunLoopRun();
     pub fn CFRunLoopStop(rl: CFRunLoopRef);
+
+    pub fn CFRunLoopSourceCreate(
+        allocator: CFAllocatorRef,
+        order: CFIndex,
+        context: *mut CFRunLoopSourceContext,
+    ) -> CFRunLoopSourceRef;
+    pub fn CFRunLoopAddSource(
+        rl: CFRunLoopRef,
+        source: CFRunLoopSourceRef,
+        mode: CFStringRef,
+    );
 
     pub fn CFStringCreateWithCString(
         alloc: CFAllocatorRef,
@@ -135,6 +169,10 @@ pub(super) struct EventLoopState {
     /// to let `watch_dir` wait until the stream is actually running.
     pub stream_generation: Mutex<u64>,
     pub stream_started: Condvar,
+    /// Counts how many times the event loop passed through the no-paths branch.
+    /// A healthy loop parks there and barely moves. A busy loop spins it.
+    #[cfg(test)]
+    pub empty_iterations: AtomicUsize,
 }
 
 /// Creates a CFArray of CFStringRef from the given paths.
@@ -206,6 +244,10 @@ struct CallbackInfo {
     state: Arc<EventLoopState>,
 }
 
+// Perform callback for the keep-alive source. The source is never signaled so
+// this never runs. It only needs to exist to satisfy the source contract.
+extern "C" fn noop_perform(_info: *mut c_void) {}
+
 /// Run the FSEvents event loop on the current thread.
 /// `run_loop_out` receives the CFRunLoopRef once the loop starts so other threads can stop it.
 /// `get_paths` returns the current set of paths to watch (as null-terminated UTF-8 byte vectors).
@@ -224,6 +266,24 @@ pub(super) fn event_loop(
         let current_loop = CFRunLoopGetCurrent();
         *run_loop_out.lock().unwrap() = Some(SendableCFRunLoopRef(current_loop));
 
+        // Add a keep-alive source so the run loop always has an input source.
+        // Without it CFRunLoopRun returns immediately whenever no stream is
+        // scheduled, which spins the loop until the first root is watched.
+        let mut keepalive_ctx = CFRunLoopSourceContext {
+            version: 0,
+            info: ptr::null_mut(),
+            retain: None,
+            release: None,
+            copy_description: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: Some(noop_perform),
+        };
+        let keepalive = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &mut keepalive_ctx);
+        CFRunLoopAddSource(current_loop, keepalive, kCFRunLoopDefaultMode);
+
         let callback_info = Box::new(CallbackInfo {
             handler: Box::new(handler),
             notify: Box::new(notify),
@@ -234,8 +294,11 @@ pub(super) fn event_loop(
         loop {
             let paths = get_paths();
             if paths.is_empty() {
-                // No paths to watch yet; block on the run loop waiting for a wake
-                // We need a dummy source to prevent CFRunLoopRun from returning immediately
+                #[cfg(test)]
+                state
+                    .empty_iterations
+                    .fetch_add(1, atomic::Ordering::Relaxed);
+                // No paths to watch yet. Park on the run loop until something wakes us.
                 CFRunLoopRun();
                 if state.shutdown.load(atomic::Ordering::Relaxed) {
                     break;
@@ -305,7 +368,8 @@ pub(super) fn event_loop(
             state.needs_restart.store(false, atomic::Ordering::Relaxed);
         }
 
-        // Clean up callback info
+        // Clean up the keep-alive source and callback info.
+        CFRelease(keepalive as *const c_void);
         drop(Box::from_raw(info_ptr));
     }
 }

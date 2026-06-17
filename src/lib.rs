@@ -116,6 +116,11 @@ impl Watcher {
         self.state.recrawls.load(atomic::Ordering::Relaxed)
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub fn empty_iterations(&self) -> usize {
+        self.notify.empty_iterations()
+    }
+
     pub fn shutdown(&self) {
         self.notify.shutdown();
     }

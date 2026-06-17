@@ -52,6 +52,13 @@ impl FseventWatcher {
             .load(atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub fn empty_iterations(&self) -> usize {
+        self.event_loop_state
+            .empty_iterations
+            .load(atomic::Ordering::Relaxed)
+    }
+
     pub fn new(
         #[cfg(test)] _slow: bool,
         state: Arc<WatcherState>,
@@ -64,6 +71,8 @@ impl FseventWatcher {
             ),
             stream_generation: std::sync::Mutex::new(0),
             stream_started: std::sync::Condvar::new(),
+            #[cfg(test)]
+            empty_iterations: std::sync::atomic::AtomicUsize::new(0),
         });
 
         let watcher = Arc::new(Self {
