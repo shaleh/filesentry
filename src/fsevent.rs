@@ -153,18 +153,16 @@ impl FseventWatcher {
         roots.push(path);
         drop(roots);
 
-        // Read current generation before triggering restart
-        let gen = self.event_loop_state.stream_generation.lock().unwrap();
-        let target = *gen + 1;
-        drop(gen);
-
         self.event_loop_state
             .needs_restart
             .store(true, atomic::Ordering::Relaxed);
-        self.wake_run_loop();
 
-        // Wait until the event loop has actually (re)started the stream
+        // Hold the generation lock from reading the target through the wait.
+        // That way the event loop cannot bump the generation and signal in the
+        // gap between, which would drop the wakeup and block us forever.
         let gen = self.event_loop_state.stream_generation.lock().unwrap();
+        let target = *gen + 1;
+        self.wake_run_loop();
         let _gen = self
             .event_loop_state
             .stream_started
