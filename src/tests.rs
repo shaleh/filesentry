@@ -222,6 +222,82 @@ fn modify() {
     });
 }
 
+// A watcher created before any root is added must park its event loop, not
+// spin. Without a keep-alive source the macOS run loop returns immediately when
+// nothing is scheduled, so the loop burns a core until the first root arrives.
+#[test]
+#[cfg(target_os = "macos")]
+fn no_busy_loop_without_roots() {
+    let _ = env_logger::builder().try_init();
+    let watcher = Watcher::new_impl(false).unwrap();
+    let guard = watcher.shutdown_guard();
+    watcher.start();
+    // Long enough that a spinning loop would rack up thousands of iterations.
+    std::thread::sleep(Duration::from_millis(500));
+    let spins = watcher.empty_iterations();
+    drop(guard);
+    assert!(
+        spins < 50,
+        "event loop spun {spins} times with no roots; expected it to park"
+    );
+}
+
+// macOS has no slow-read knob to force a queue overflow on demand the way the
+// inotify path does. This hammers the watcher with many files at once and
+// asserts not a single create is lost, whether FSEvents delivers them directly
+// or coalesces into a MUST_SCAN_SUB_DIRS recrawl. It is the macOS stand-in for
+// queue_overflow.
+#[test]
+#[cfg(target_os = "macos")]
+fn bulk_create_no_lost_events() {
+    with_watcher(|dir, watcher| {
+        let files: Vec<_> = (0..20_000).map(|i| format!("foo{}/bar{i}", i % 200)).collect();
+        let assertion = Assertion::new(
+            watcher,
+            dir,
+            files.iter().map(|file| (&**file, EventType::Create)),
+        );
+        for file in &files {
+            mk_write(dir, file, "content1");
+        }
+        assertion.check();
+        eprintln!("bulk_create_no_lost_events observed all files after {} recrawls", watcher.recrawls());
+    });
+}
+
+// A file created and then modified inside one settle window must surface as a
+// single Create. FSEvents can coalesce CREATED and MODIFIED onto one event, and
+// the if/else-if flag handling only reads the create flag. This confirms the
+// create is never dropped, since the debouncer folds the modify into it.
+#[test]
+#[cfg(target_os = "macos")]
+fn create_then_modify_coalesces_to_create() {
+    with_watcher(|dir, watcher| {
+        let assertion = Assertion::new(watcher, dir, [("a", EventType::Create)]);
+        write(dir, "a", "v1");
+        write(dir, "a", "v2");
+        write(dir, "a", "v3");
+        assertion.check();
+    });
+}
+
+// A burst of modifies to an existing file must surface as a single Modified,
+// not be dropped. Guards the steady-state side of the same flag handling.
+#[test]
+#[cfg(target_os = "macos")]
+fn rapid_modify_of_existing_file() {
+    with_watcher(|dir, watcher| {
+        let assertion = Assertion::new(watcher, dir, [("a", EventType::Create)]);
+        write(dir, "a", "v1");
+        assertion.check();
+        let assertion = Assertion::new(watcher, dir, [("a", EventType::Modified)]);
+        write(dir, "a", "v2");
+        write(dir, "a", "v3");
+        write(dir, "a", "v4");
+        assertion.check();
+    });
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn queue_overflow() {
