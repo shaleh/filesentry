@@ -219,14 +219,13 @@ extern "C" fn fsevent_callback(
 ) {
     unsafe {
         let info = &*(client_callback_info as *const CallbackInfo);
-        let paths = event_paths as *const *const c_char;
+        let paths = std::slice::from_raw_parts(event_paths as *const *const c_char, num_events);
         let flags = std::slice::from_raw_parts(event_flags, num_events);
         let ids = std::slice::from_raw_parts(event_ids, num_events);
 
-        for i in 0..num_events {
-            let path_cstr = CStr::from_ptr(*paths.add(i));
-            let path = path_cstr.to_bytes();
-            (info.handler)(path, flags[i]);
+        for (&path_ptr, &flag) in paths.iter().zip(flags) {
+            let path = CStr::from_ptr(path_ptr).to_bytes();
+            (info.handler)(path, flag);
         }
 
         // Track the latest event ID for gap-free restarts
@@ -238,9 +237,12 @@ extern "C" fn fsevent_callback(
     }
 }
 
+type EventHandler = Box<dyn Fn(&[u8], FSEventStreamEventFlags) + Send + Sync>;
+type NotifyFn = Box<dyn Fn() + Send + Sync>;
+
 struct CallbackInfo {
-    handler: Box<dyn Fn(&[u8], FSEventStreamEventFlags) + Send + Sync>,
-    notify: Box<dyn Fn() + Send + Sync>,
+    handler: EventHandler,
+    notify: NotifyFn,
     state: Arc<EventLoopState>,
 }
 

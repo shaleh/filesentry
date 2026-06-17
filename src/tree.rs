@@ -67,6 +67,7 @@ impl NodeMeta {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // public iterator kept for the tree API, not yet wired up
 pub struct TreeIter<'a> {
     iter: slice::Iter<'a, FsNode>,
 }
