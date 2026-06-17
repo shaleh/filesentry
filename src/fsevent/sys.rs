@@ -333,7 +333,12 @@ pub(super) fn event_loop(
             );
 
             FSEventStreamScheduleWithRunLoop(stream, current_loop, kCFRunLoopDefaultMode);
-            FSEventStreamStart(stream);
+            if !FSEventStreamStart(stream) {
+                // The stream failed to start, so no events will arrive from it.
+                // We still advance the generation below. A waiting watch_dir
+                // must be released rather than blocked forever on a dead stream.
+                log::error!("FSEventStreamStart failed; file events will not be delivered");
+            }
 
             // Signal that the stream is running so watch_dir can proceed
             {
