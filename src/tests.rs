@@ -128,17 +128,23 @@ fn init_watcher_imp(slow: bool) -> (TempDir, Watcher) {
     rx.recv_timeout(*TIMEOUT).expect("failed to start watcher");
     (dir, watcher)
 }
+// The watcher canonicalizes every root and reports events under the canonical path,
+// so expectations must be built from the canonical temp dir too — otherwise they
+// break wherever it sits behind a symlink (on macOS `$TMPDIR` is under `/var/...`,
+// a symlink to `/private/var/...`).
 fn with_watcher(f: impl FnOnce(&Path, &Watcher)) {
     let (dir, watcher) = init_watcher();
     let shutdown_guard = watcher.shutdown_guard();
-    f(dir.path(), &watcher);
+    let path = dir.path().canonicalize().unwrap();
+    f(&path, &watcher);
     drop(shutdown_guard)
 }
 
 fn with_watcher_slow(f: impl FnOnce(&Path, &Watcher)) {
     let (dir, watcher) = init_watcher_slow();
     let shutdown_guard = watcher.shutdown_guard();
-    f(dir.path(), &watcher);
+    let path = dir.path().canonicalize().unwrap();
+    f(&path, &watcher);
     drop(shutdown_guard)
 }
 
@@ -217,6 +223,7 @@ fn modify() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn queue_overflow() {
     with_watcher_slow(|dir, watcher| {
         let files: Vec<_> = (0..20_0000)
@@ -246,4 +253,24 @@ fn queue_overflow() {
             "expected atleast 2 recrawls but found {recrawls}"
         )
     });
+}
+
+/// Stress the backend teardown path: start a watch, churn files, then shut down
+/// while native callbacks may still be in flight, repeatedly. This smoke-tests
+/// rapid create/shutdown cycles on every platform; under the AddressSanitizer CI
+/// job (macOS) it specifically guards the FSEvents callback's `info` lifetime --
+/// a non-retained payload would use-after-free here.
+#[test]
+fn teardown_with_pending_events_is_safe() {
+    for _ in 0..16 {
+        let dir = TempDir::new().unwrap();
+        let watcher = Watcher::new().unwrap();
+        watcher.add_handler(|_| true);
+        let _ = watcher.add_root(dir.path(), true, |_| {});
+        watcher.start();
+        for i in 0..40 {
+            let _ = fs::write(dir.path().join(format!("f{i}")), b"data");
+        }
+        watcher.shutdown();
+    }
 }
