@@ -28,6 +28,10 @@ impl std::fmt::Debug for Config {
 
 pub trait Filter: 'static + Send + Sync {
     fn ignore_path_rec(&self, mut path: &Path, is_dir: Option<bool>) -> bool {
+        // The leaf is checked with the caller-provided `is_dir`; every ancestor of a path is
+        // necessarily a directory, so check those with `Some(true)` (filters with dir-only
+        // patterns such as gitignore's `target/` depend on this).
+        let mut is_dir = is_dir;
         loop {
             if self.ignore_path(path, is_dir) {
                 return true;
@@ -36,6 +40,7 @@ pub trait Filter: 'static + Send + Sync {
                 break;
             };
             path = parent;
+            is_dir = Some(true);
         }
         false
     }
@@ -45,5 +50,28 @@ pub trait Filter: 'static + Send + Sync {
 impl Filter for () {
     fn ignore_path(&self, path: &Path, _is_dir: Option<bool>) -> bool {
         path.ends_with(".git")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ignores a path component named `target`, but only when it is a directory.
+    struct DirOnlyTarget;
+    impl Filter for DirOnlyTarget {
+        fn ignore_path(&self, path: &Path, is_dir: Option<bool>) -> bool {
+            is_dir == Some(true) && path.file_name().is_some_and(|n| n == "target")
+        }
+    }
+
+    #[test]
+    fn ignore_path_rec_treats_ancestors_as_dirs() {
+        let f = DirOnlyTarget;
+        // The leaf is a file, but its ancestor `target` is a directory and must be
+        // recognized as ignored even though the leaf is passed as `Some(false)`.
+        assert!(f.ignore_path_rec(Path::new("/proj/target/foo.rs"), Some(false)));
+        // No ignored-directory ancestor: not ignored.
+        assert!(!f.ignore_path_rec(Path::new("/proj/src/foo.rs"), Some(false)));
     }
 }
