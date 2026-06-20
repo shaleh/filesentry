@@ -58,6 +58,12 @@ impl EventDebouncer {
                     (EventType::Delete, EventType::Create) => {
                         event.ty = EventType::Modified;
                     }
+                    // A tempfile (created then deleted within the window) that is created
+                    // again exists once more: report it as a `Create`, not a `Tempfile`
+                    // (which the consumer would ignore).
+                    (EventType::Tempfile, EventType::Create) => {
+                        event.ty = EventType::Create;
+                    }
                     (EventType::Create, EventType::Modified)
                     | (EventType::Modified, EventType::Modified) => (),
                     (old, new) => {
@@ -104,5 +110,27 @@ impl From<Vec<Event>> for Events {
         Self {
             events: events.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::path::CanonicalPathBuf;
+    use std::path::Path;
+
+    fn path(p: &str) -> CanonicalPathBuf {
+        CanonicalPathBuf::assert_canonicalized(Path::new(p))
+    }
+
+    #[test]
+    fn recreated_tempfile_is_a_create() {
+        let mut debouncer = EventDebouncer::new();
+        debouncer.add(path("/tmp/x"), EventType::Create);
+        debouncer.add(path("/tmp/x"), EventType::Delete);
+        debouncer.add(path("/tmp/x"), EventType::Create);
+        let events = debouncer.take();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ty, EventType::Create);
     }
 }
