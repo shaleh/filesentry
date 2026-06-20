@@ -29,6 +29,7 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus,
     PostQueuedCompletionStatus, OVERLAPPED,
 };
+use windows_sys::Win32::System::Threading::CreateEventW;
 
 use crate::backend::Backend;
 use crate::path::CanonicalPathBuf;
@@ -54,6 +55,12 @@ struct Root {
     handle: HANDLE,
     buffer: Vec<u8>,
     overlapped: OVERLAPPED,
+    /// Manual-reset event stored in `overlapped.hEvent`. The directory handle is
+    /// bound to the IOCP, so a completion is queued to the port and the file handle
+    /// is *not* a reliable wait object; `shutdown`'s `GetOverlappedResult(bWait=TRUE)`
+    /// waits on this event instead to know a cancelled read has truly finished
+    /// (kernel no longer writing into `buffer`) before the `Root` is freed.
+    event: HANDLE,
     /// Whether to watch the whole subtree (passed to `ReadDirectoryChangesW`).
     recursive: bool,
 }
@@ -219,6 +226,9 @@ impl Drop for WindowsWatcher {
 /// (Re)issue the overlapped `ReadDirectoryChangesW` for a root.
 fn issue_read(root: &mut Root) -> io::Result<()> {
     root.overlapped = unsafe { std::mem::zeroed() };
+    // Keep the completion-port wakeup (we don't set the hEvent low bit), but also
+    // have the kernel signal `event` on completion so teardown can wait on it.
+    root.overlapped.hEvent = root.event;
     let len = root.buffer.len() as u32;
     let ptr = root.buffer.as_mut_ptr() as *mut c_void;
     let ok = unsafe {
@@ -282,17 +292,29 @@ impl crate::backend::Backend for WindowsWatcher {
             unsafe { CloseHandle(handle) };
             return Err(err);
         }
+        // Manual-reset, initially non-signaled: the kernel signals it on read
+        // completion (see `Root::event`); we only wait on it during teardown.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            let err = io::Error::last_os_error();
+            unsafe { CloseHandle(handle) };
+            return Err(err);
+        }
         let mut root = Box::new(Root {
             path,
             handle,
             buffer: vec![0u8; BUF_LEN],
             overlapped: unsafe { std::mem::zeroed() },
+            event,
             recursive,
         });
         if let Err(err) = issue_read(&mut root) {
             // `Root` has no `Drop` and we never pushed it into `roots`, so close the
-            // directory handle here or it (and its IOCP association) would leak.
-            unsafe { CloseHandle(root.handle) };
+            // directory handle and event here or they (and the IOCP association) leak.
+            unsafe {
+                CloseHandle(root.handle);
+                CloseHandle(root.event);
+            }
             return Err(err);
         }
         roots.push(root);
@@ -314,10 +336,12 @@ impl crate::backend::Backend for WindowsWatcher {
                 unsafe {
                     // A `ReadDirectoryChangesW` may still be in flight with the kernel
                     // holding pointers into `root.buffer`/`root.overlapped`. Cancel it and
-                    // wait (GetOverlappedResult bWait=TRUE, which blocks on the file handle
-                    // independently of the IOCP) before the `Box<Root>` is dropped, or the
-                    // kernel could write into freed memory. `CancelIoEx` returns 0 when no
-                    // read is pending — nothing to wait for then.
+                    // wait before the `Box<Root>` is dropped, or the kernel could write
+                    // into freed memory. The handle is IOCP-bound, so the completion goes
+                    // to the port and the file handle is not a reliable wait object;
+                    // `GetOverlappedResult(bWait=TRUE)` waits on `root.overlapped.hEvent`
+                    // (`root.event`) instead, which the kernel signals on completion.
+                    // `CancelIoEx` returns 0 when no read is pending — nothing to wait for.
                     if CancelIoEx(root.handle, &root.overlapped) != 0 {
                         let mut transferred = 0u32;
                         GetOverlappedResult(
@@ -328,6 +352,7 @@ impl crate::backend::Backend for WindowsWatcher {
                         );
                     }
                     CloseHandle(root.handle);
+                    CloseHandle(root.event);
                 }
             }
             // The kernel is done with every buffer/OVERLAPPED, so freeing the Boxes is safe.

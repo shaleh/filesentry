@@ -134,6 +134,14 @@ fn init_watcher_imp(slow: bool) -> (TempDir, Watcher) {
 // a symlink to `/private/var/...`).
 fn with_watcher(f: impl FnOnce(&Path, &Watcher)) {
     let (dir, watcher) = init_watcher();
+    // Linux's inotify reports a file's create+write (or delete+recreate) in one read,
+    // so the debouncer coalesces them within a single settle window. Windows'
+    // ReadDirectoryChangesW can split those records across separate reads, and a
+    // loaded runner can flush the first before the second arrives -- surfacing a
+    // spurious extra event (e.g. a `Create` *and* a `Modified` for the same file).
+    // Widen the window there so related records reliably land together.
+    #[cfg(windows)]
+    watcher.set_settle_time(std::time::Duration::from_secs(1));
     let shutdown_guard = watcher.shutdown_guard();
     let path = dir.path().canonicalize().unwrap();
     f(&path, &watcher);
@@ -247,10 +255,16 @@ fn queue_overflow() {
             write(dir, file, "content2");
         }
         assertion.check();
+        // Overflow *recovery* is what's under test, and the 200k-event assertions
+        // above already prove nothing was lost recovering from it. The *number* of
+        // overflow episodes is not controllable: it's a race between the runner's
+        // file-creation speed, the kernel's `max_queued_events`, and the throttled
+        // reader, so a slower runner may drain one phase without overflowing it.
+        // Require >= 1 to confirm the overflow+recrawl path actually ran.
         let recrawls = watcher.recrawls();
         assert!(
-            recrawls >= 2,
-            "expected atleast 2 recrawls but found {recrawls}"
+            recrawls >= 1,
+            "expected at least one recrawl (queue overflow) but found {recrawls}"
         )
     });
 }

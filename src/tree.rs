@@ -518,7 +518,12 @@ impl FileTree {
                 let (node, _) = work_stack.pop().unwrap();
                 for &child in &self.dirs[self[node].children.idx()].clone() {
                     if self.nodes[child.idx()].maybe_deleted_flag() {
-                        emit_event(self[child].path.clone(), EventType::Delete);
+                        // Only files generate events (mirrors `apply_change`'s delete
+                        // branch and `delete_rec`); a vanished directory surfaces as the
+                        // deletion of the files it contained, not a delete of itself.
+                        if self[child].meta.is_file() {
+                            emit_event(self[child].path.clone(), EventType::Delete);
+                        }
                         self.delete_rec(child, work_stack, &mut emit_event);
                     }
                 }
@@ -538,7 +543,11 @@ impl FileTree {
         while let Some((node, _)) = work_stack.pop() {
             for &child in &self.dirs[self[node].children.idx()].clone() {
                 if self.nodes[child.idx()].maybe_deleted_flag() {
-                    emit_event(self[child].path.clone(), EventType::Delete);
+                    // see the matching loop above: directories don't emit their own
+                    // delete, only the files underneath them do.
+                    if self[child].meta.is_file() {
+                        emit_event(self[child].path.clone(), EventType::Delete);
+                    }
                     self.delete_rec(child, work_stack, &mut emit_event);
                 }
             }
@@ -631,14 +640,19 @@ mod tests {
         use std::fs;
 
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
+        // Canonicalize so the path is already in `CanonicalPathBuf` form: on Windows a
+        // bare `C:\..` temp path (no leading separator) would be mangled by `push`,
+        // and on macOS `/var` resolves to `/private/var`. Derive children from it so
+        // they match the crawl-built tree nodes byte-for-byte.
+        let root_path = dir.path().canonicalize().unwrap();
+        let sub = root_path.join("sub");
         fs::create_dir(&sub).unwrap();
         let file = sub.join("f");
         fs::write(&file, b"v1").unwrap();
 
         let mut tree = FileTree::new();
         let root = tree
-            .add_root(CanonicalPathBuf::assert_canonicalized(dir.path()), true)
+            .add_root(CanonicalPathBuf::assert_canonicalized(&root_path), true)
             .unwrap();
         tree.crawl_root(root, true, &(), |_| {});
 
@@ -664,6 +678,52 @@ mod tests {
                 .iter()
                 .any(|(p, ty)| *ty == EventType::Modified && p.as_std_path().ends_with("f")),
             "expected a Modified event for the inner file, got {events:?}",
+        );
+    }
+
+    /// A directory that vanished between crawls must surface as deletes of the
+    /// files it contained -- never a delete of the directory itself (only files
+    /// generate events). Exercised here cross-platform; on macOS the same crawl
+    /// path is what the `delete` integration test hits.
+    #[test]
+    fn crawl_deleted_dir_emits_only_inner_file_delete() {
+        use super::FileTree;
+        use crate::events::EventType;
+        use crate::path::CanonicalPathBuf;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize the root (see `non_recursive_crawl_detects_inner_change`): a bare
+        // Windows `C:\..` path isn't in `CanonicalPathBuf` form and would be mangled.
+        let root_path = dir.path().canonicalize().unwrap();
+        let bar = root_path.join("bar");
+        fs::create_dir(&bar).unwrap();
+        fs::write(bar.join("baz"), b"v1").unwrap();
+
+        let mut tree = FileTree::new();
+        let root = tree
+            .add_root(CanonicalPathBuf::assert_canonicalized(&root_path), true)
+            .unwrap();
+        let mut work_stack = Vec::new();
+        tree.crawl_root(root, true, &(), |_| {});
+
+        fs::remove_file(bar.join("baz")).unwrap();
+        fs::remove_dir(&bar).unwrap();
+
+        let mut events = Vec::new();
+        tree.crawl(
+            root,
+            &(),
+            &mut work_stack,
+            |path, ty| events.push((path, ty)),
+            |_| {},
+        );
+
+        assert_eq!(events.len(), 1, "expected only the inner file delete, got {events:?}");
+        assert_eq!(events[0].1, EventType::Delete);
+        assert!(
+            events[0].0.as_std_path().ends_with("baz"),
+            "expected the file delete, got {events:?}",
         );
     }
 

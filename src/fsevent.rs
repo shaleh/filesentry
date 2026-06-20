@@ -11,11 +11,13 @@
 //! a re-stat of the reported directory and the worker diffs it against the tree.
 //! `kFSEventStreamEventFlagMustScanSubDirs` (coalescing/overflow) maps to a full
 //! recrawl, mirroring inotify's `QUEUE_OVERFLOW`. The stream is rebuilt when a new
-//! (uncovered) root is added, since FSEvents fixes its path list at creation.
+//! (uncovered) root is added, since FSEvents fixes its path list at creation; the
+//! rebuilt stream resumes from the newest event id seen (`last_event_id`) so the
+//! existing roots' events buffered across the teardown are replayed, not lost.
 
 use std::ffi::{c_void, CStr};
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{self, AtomicBool};
+use std::sync::atomic::{self, AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::{io, ptr};
@@ -58,8 +60,6 @@ type FSEventStreamCallback = extern "C" fn(
 const K_FS_EVENT_STREAM_CREATE_FLAG_NO_DEFER: u32 = 0x0000_0002;
 const K_FS_EVENT_STREAM_CREATE_FLAG_WATCH_ROOT: u32 = 0x0000_0004;
 const K_FS_EVENT_STREAM_EVENT_FLAG_MUST_SCAN_SUBDIRS: u32 = 0x0000_0001;
-// kFSEventStreamEventIdSinceNow == u64::MAX (start watching from now on).
-const K_FS_EVENT_STREAM_EVENT_ID_SINCE_NOW: u64 = u64::MAX;
 
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
@@ -77,6 +77,10 @@ unsafe extern "C" {
     fn FSEventStreamStop(stream: FSEventStreamRef);
     fn FSEventStreamInvalidate(stream: FSEventStreamRef);
     fn FSEventStreamRelease(stream: FSEventStreamRef);
+    /// The newest event id the system has issued. Used to anchor "now" when first
+    /// building a stream so a later rebuild can resume from a concrete id even if
+    /// no event has arrived yet.
+    fn FSEventsGetCurrentEventId() -> FSEventStreamEventId;
 }
 
 // --- libdispatch FFI ---------------------------------------------------------
@@ -98,6 +102,12 @@ pub(crate) struct FsEventWatcher {
     queue: *mut c_void, // serial dispatch queue the callback runs on
     pub changes: Arc<PendingChangesLock>,
     state: Arc<WatcherState>,
+    /// Newest FSEvents id seen so far, or 0 before the first stream is built.
+    /// Each rebuild resumes the stream from here instead of `SinceNow`, so events
+    /// buffered for the existing roots during the teardown/recreate window are
+    /// replayed rather than lost -- no full recrawl needed. Updated by the callback
+    /// (serialized on the dispatch queue) and read under `inner`'s lock at rebuild.
+    last_event_id: Arc<AtomicU64>,
 }
 
 // The raw CF/dispatch pointers are only touched under `inner`'s lock or are
@@ -127,6 +137,7 @@ impl FsEventWatcher {
             queue,
             changes: Arc::new(PendingChangesLock::default()),
             state,
+            last_event_id: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -145,6 +156,16 @@ impl FsEventWatcher {
                 return Ok(());
             }
             let paths = cf_paths(&inner.roots);
+            // Resume from the newest id seen so far rather than `SinceNow`, so events
+            // buffered for the existing roots while the stream is torn down and
+            // recreated are replayed instead of dropped. The first build has no id
+            // yet; anchor it on the current system id so the *next* rebuild has a
+            // concrete point to resume from even if no event arrived in between.
+            let mut since_when = self.last_event_id.load(atomic::Ordering::Relaxed);
+            if since_when == 0 {
+                since_when = FSEventsGetCurrentEventId();
+                self.last_event_id.store(since_when, atomic::Ordering::Relaxed);
+            }
             // The stream owns this heap `CallbackInfo` and frees it via
             // `release_callback` only after the last callback, so an in-flight
             // callback can never outlive the data it reads. See `CallbackInfo` for
@@ -152,6 +173,7 @@ impl FsEventWatcher {
             let info = Box::into_raw(Box::new(CallbackInfo {
                 state: self.state.clone(),
                 changes: self.changes.clone(),
+                last_event_id: self.last_event_id.clone(),
             }));
             let mut context = FSEventStreamContext {
                 version: 0,
@@ -165,7 +187,7 @@ impl FsEventWatcher {
                 callback,
                 &mut context,
                 paths,
-                K_FS_EVENT_STREAM_EVENT_ID_SINCE_NOW,
+                since_when,
                 0.1, // latency seconds; the worker also debounces via settle_time
                 K_FS_EVENT_STREAM_CREATE_FLAG_NO_DEFER | K_FS_EVENT_STREAM_CREATE_FLAG_WATCH_ROOT,
             );
@@ -213,17 +235,11 @@ impl crate::backend::Backend for FsEventWatcher {
         }
         inner.roots.push(path);
         // Rebuilding tears down the existing stream (FSEvents fixes its path list at
-        // creation), discarding events buffered in the latency window. The replacement
-        // only reports from `kFSEventStreamEventIdSinceNow` on. So when we actually
-        // replaced a stream, recrawl to resync the existing roots and recover anything
-        // missed in that window.
-        let replaced_stream = !inner.stream.is_null();
+        // creation). The replacement resumes from `last_event_id` (see
+        // `rebuild_stream`), so events buffered for the existing roots during the
+        // teardown/recreate window are replayed -- no recrawl needed to resync them.
+        // The new root's own initial state is crawled separately by the worker.
         self.rebuild_stream(&mut inner)?;
-        drop(inner);
-        if replaced_stream {
-            self.changes.lock().recrawl();
-            self.changes.notify();
-        }
         Ok(())
     }
 
@@ -304,6 +320,7 @@ unsafe fn cf_paths(paths: &[CanonicalPathBuf]) -> CFArrayRef {
 struct CallbackInfo {
     state: Arc<WatcherState>,
     changes: Arc<PendingChangesLock>,
+    last_event_id: Arc<AtomicU64>,
 }
 
 /// Called by FSEvents when the stream is released; frees the `CallbackInfo` box.
@@ -321,7 +338,7 @@ extern "C" fn callback(
     num_events: usize,
     event_paths: *mut c_void,
     event_flags: *const FSEventStreamEventFlags,
-    _event_ids: *const FSEventStreamEventId,
+    event_ids: *const FSEventStreamEventId,
 ) {
     // This runs from libdispatch through C frames, where a panic unwinding across
     // an `extern "C"` fn aborts the whole host process (helix), not just the
@@ -334,11 +351,18 @@ extern "C" fn callback(
         }
         // SAFETY: `info` is the `CallbackInfo` boxed at stream creation; the stream
         // keeps it alive until after the last callback (see `rebuild_stream`).
-        // `event_paths` is a `char **` and `event_flags` an array, both of
-        // `num_events`.
+        // `event_paths` is a `char **` and `event_flags`/`event_ids` are arrays,
+        // all of `num_events`.
         let info = unsafe { &*(info as *const CallbackInfo) };
         let paths = event_paths as *const *const i8;
         let flags = unsafe { std::slice::from_raw_parts(event_flags, num_events) };
+        // Record the newest id so a stream rebuild resumes just after it. Ids are
+        // monotonic within (and across) batches; the `HistoryDone` sentinel and
+        // other synthetic events carry id 0, so skip those.
+        let ids = unsafe { std::slice::from_raw_parts(event_ids, num_events) };
+        if let Some(&id) = ids.iter().rev().find(|&&id| id != 0) {
+            info.last_event_id.store(id, atomic::Ordering::Relaxed);
+        }
         let events = (0..num_events).map(|i| {
             let cstr = unsafe { CStr::from_ptr(*paths.add(i)) };
             let os = std::ffi::OsStr::from_bytes(cstr.to_bytes());
@@ -348,6 +372,18 @@ extern "C" fn callback(
     }));
     if result.is_err() {
         log::error!("filesentry: panic in FSEvents callback was contained");
+    }
+}
+
+/// Strip a single trailing `/` from an FSEvents path (kept off the root `/`
+/// itself), restoring `CanonicalPathBuf`'s "never ends in a separator" invariant.
+fn strip_trailing_sep(path: &std::path::Path) -> &std::path::Path {
+    let bytes = path.as_os_str().as_bytes();
+    match bytes.strip_suffix(b"/") {
+        Some(stripped) if !stripped.is_empty() => {
+            std::path::Path::new(std::ffi::OsStr::from_bytes(stripped))
+        }
+        _ => path,
     }
 }
 
@@ -373,6 +409,13 @@ fn process_events<'a>(
             changes.recrawl();
             break;
         }
+        // FSEvents reports directory paths with a trailing `/`, but
+        // `CanonicalPathBuf` requires paths to never end in a separator: a
+        // trailing slash makes `foo/bar/` hash and compare distinct from the
+        // crawl-built `foo/bar`, spawning a duplicate tree node that a later
+        // crawl then reports as spuriously deleted. Strip it so the path matches
+        // the canonical node.
+        let path = strip_trailing_sep(path);
         let path = CanonicalPathBuf::assert_canonicalized(path);
         // `ignore_path_rec`, not `ignore_path`: FSEvents has no per-directory
         // exclusion, so it reports writes under an ignored directory too. inotify
@@ -402,6 +445,7 @@ mod tests {
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
+            last_event_id: watcher.notify.last_event_id.clone(),
         };
 
         // Poison the config mutex the way a panicking handler would.
@@ -424,6 +468,33 @@ mod tests {
         );
     }
 
+    /// FSEvents hands directory paths to the callback with a trailing `/`. The
+    /// recorded change must drop it so it matches the crawl-built canonical node
+    /// (`foo/bar`, not `foo/bar/`); otherwise a duplicate tree node is created and
+    /// later reported as a spurious delete.
+    #[test]
+    fn callback_strips_trailing_slash() {
+        let watcher = Watcher::new_impl(false).unwrap();
+        let info = CallbackInfo {
+            state: watcher.state.clone(),
+            changes: watcher.notify.changes.clone(),
+            last_event_id: watcher.notify.last_event_id.clone(),
+        };
+
+        process_events(
+            &info,
+            std::iter::once((Path::new("/tmp/filesentry-test/sub/"), 0u32)),
+        );
+
+        let recorded: Vec<_> = info.changes.lock().drain().map(|c| c.path).collect();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].as_std_path(),
+            Path::new("/tmp/filesentry-test/sub"),
+            "the trailing slash must be stripped",
+        );
+    }
+
     /// A path under an ignored *ancestor* (not just a directly-ignored leaf) must be
     /// dropped. The default `()` filter ignores a `.git` component.
     #[test]
@@ -432,6 +503,7 @@ mod tests {
         let info = CallbackInfo {
             state: watcher.state.clone(),
             changes: watcher.notify.changes.clone(),
+            last_event_id: watcher.notify.last_event_id.clone(),
         };
 
         // A directory *inside* an ignored `.git` -- the leaf itself is not `.git`.
@@ -456,33 +528,39 @@ mod tests {
     }
 
     /// Adding a second root rebuilds the single FSEvents stream, tearing the old one
-    /// down. Events buffered for the already-watched roots are lost with it and the
-    /// new stream starts `SinceNow`, so the rebuild must request a recrawl to resync
-    /// the existing roots. (The first root has no predecessor, so it must not.)
+    /// down. The replacement resumes from `last_event_id` (anchored on the current
+    /// system id at the first build), so events for the already-watched roots are
+    /// replayed rather than lost -- no recrawl is forced, unlike the old `SinceNow`
+    /// rebuild which had to recrawl to recover them.
     #[test]
-    fn adding_a_root_resyncs_existing_roots() {
+    fn adding_a_root_resumes_without_recrawl() {
         use crate::backend::Backend;
+        use std::sync::atomic::Ordering;
 
         let watcher = Watcher::new_impl(false).unwrap();
         let fs = &watcher.notify;
         let d1 = tempfile::tempdir().unwrap();
         let d2 = tempfile::tempdir().unwrap();
 
-        // First root builds the initial stream; nothing to resync yet.
+        // First root builds the initial stream and anchors `last_event_id` on the
+        // current system id, giving later rebuilds a concrete point to resume from.
         fs.watch_dir(CanonicalPathBuf::assert_canonicalized(d1.path()), true)
             .unwrap();
-        assert!(
-            !fs.changes.lock().take_recrawl(),
-            "the first root should not force a recrawl",
+        assert!(!fs.changes.lock().take_recrawl());
+        assert_ne!(
+            fs.last_event_id.load(Ordering::Relaxed),
+            0,
+            "the first build must anchor last_event_id so rebuilds can resume",
         );
 
-        // A second, unrelated root rebuilds (tears down) the stream, which can drop
-        // events buffered for the first root -- so it must request a recrawl.
+        // A second, unrelated root rebuilds the stream. Because it resumes from
+        // last_event_id, the existing root's buffered events are replayed and no
+        // recrawl is needed.
         fs.watch_dir(CanonicalPathBuf::assert_canonicalized(d2.path()), true)
             .unwrap();
         assert!(
-            fs.changes.lock().take_recrawl(),
-            "adding a root must resync the already-watched roots",
+            !fs.changes.lock().take_recrawl(),
+            "resuming from last_event_id must not force a recrawl",
         );
     }
 }

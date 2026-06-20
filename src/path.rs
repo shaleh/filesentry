@@ -337,12 +337,20 @@ impl<T: AsRef<OsStr>> PartialEq<T> for CanonicalPathBuf {
 mod tests {
     use super::*;
 
+    /// Build a path from a `/`-separated string, rewriting separators to the
+    /// platform's so these byte-level order/parent assertions hold on Windows
+    /// (where `PATH_SEPARATOR` is `\\`, not `/`) as well as on unix.
+    fn p(s: &str) -> CanonicalPathBuf {
+        let s = s.replace('/', std::path::MAIN_SEPARATOR_STR);
+        CanonicalPathBuf::assert_canonicalized(Path::new(&s))
+    }
+
     #[test]
     fn is_parent_of_basic() {
-        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
-        let foo_bar = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar"));
-        let foo_baz = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/baz"));
-        let foobar = CanonicalPathBuf::assert_canonicalized(Path::new("/foobar"));
+        let foo = p("/foo");
+        let foo_bar = p("/foo/bar");
+        let foo_baz = p("/foo/baz");
+        let foobar = p("/foobar");
 
         // /foo is parent of /foo/bar
         assert!(foo.is_parent_of(&foo_bar));
@@ -354,8 +362,8 @@ mod tests {
 
     #[test]
     fn is_parent_of_same_path() {
-        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
-        let foo2 = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        let foo = p("/foo");
+        let foo2 = p("/foo");
 
         // /foo is NOT parent of /foo (same path)
         assert!(!foo.is_parent_of(&foo2));
@@ -363,8 +371,8 @@ mod tests {
 
     #[test]
     fn is_parent_of_longer_self() {
-        let foo_bar = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar"));
-        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        let foo_bar = p("/foo/bar");
+        let foo = p("/foo");
 
         // /foo/bar is NOT parent of /foo (self is longer)
         assert!(!foo_bar.is_parent_of(&foo));
@@ -372,9 +380,9 @@ mod tests {
 
     #[test]
     fn is_parent_of_nested() {
-        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
-        let foo_bar = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar"));
-        let foo_bar_baz = CanonicalPathBuf::assert_canonicalized(Path::new("/foo/bar/baz"));
+        let foo = p("/foo");
+        let foo_bar = p("/foo/bar");
+        let foo_bar_baz = p("/foo/bar/baz");
 
         // /foo is parent of /foo/bar/baz
         assert!(foo.is_parent_of(&foo_bar_baz));
@@ -386,7 +394,7 @@ mod tests {
     fn is_parent_of_null_terminator_safety() {
         // This test verifies that the null terminator on Unix prevents OOB access
         // when self.len() == other.as_bytes().len()
-        let foo = CanonicalPathBuf::assert_canonicalized(Path::new("/foo"));
+        let foo = p("/foo");
 
         // On Unix: foo.bytes = [/, f, o, o, \0]
         // foo.len() = 4 (excluding null)
@@ -401,10 +409,6 @@ mod tests {
             assert_eq!(foo.buf.len(), 5); // includes null
             assert_eq!(foo.len(), 4); // excludes null
         }
-    }
-
-    fn p(s: &str) -> CanonicalPathBuf {
-        CanonicalPathBuf::assert_canonicalized(Path::new(s))
     }
 
     #[test]
