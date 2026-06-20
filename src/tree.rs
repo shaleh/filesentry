@@ -264,7 +264,13 @@ impl FileTree {
             |&tree_id| self.nodes[tree_id.idx()].path == change.path,
             |id| self.hasher.hash_one(&self.nodes[id.idx()].path),
         );
-        let mut recursive = change.flags.contains(pending::Flags::NEEDS_RECURSIVE_CRAWL);
+        // A NEEDS_NON_RECURSIVE_CRAWL change (FSEvents reports *that* a directory changed,
+        // not *what*) must also trigger a (re)crawl of that directory -- otherwise the change
+        // inside it is never detected. The crawl's depth is still decided by the node's own
+        // RECURSIVE flag. (inotify never sets this flag, so the Linux path is unaffected.)
+        let mut recursive = change.flags.intersects(
+            pending::Flags::NEEDS_RECURSIVE_CRAWL | pending::Flags::NEEDS_NON_RECURSIVE_CRAWL,
+        );
         let mark_recursive = change.flags.contains(pending::Flags::MARK_RECURSIVE);
         match entry {
             Entry::Occupied(entry) => {
@@ -626,6 +632,54 @@ impl IndexMut<DirId> for FileTree {
 #[cfg(test)]
 mod tests {
     use super::{DirId, NodeId};
+
+    /// FSEvents reports "directory X changed" via `NEEDS_NON_RECURSIVE_CRAWL`; the tree must
+    /// re-crawl X and surface the change inside it. This flag used to be emitted but never
+    /// consumed, so macOS detected no in-directory changes at all.
+    #[test]
+    fn non_recursive_crawl_detects_inner_change() {
+        use super::FileTree;
+        use crate::events::EventType;
+        use crate::path::CanonicalPathBuf;
+        use crate::pending::{Flags, PendingChanges};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let file = sub.join("f");
+        fs::write(&file, b"v1").unwrap();
+
+        let mut tree = FileTree::new();
+        let root = tree
+            .add_root(CanonicalPathBuf::assert_canonicalized(dir.path()), true)
+            .unwrap();
+        tree.crawl_root(root, true, &(), |_| {});
+
+        // Change the file so a re-crawl of `sub` would notice it (different size/mtime).
+        fs::write(&file, b"v2 is longer").unwrap();
+
+        let mut changes = PendingChanges::default();
+        changes.add_watcher(
+            CanonicalPathBuf::assert_canonicalized(&sub),
+            Flags::NEEDS_NON_RECURSIVE_CRAWL,
+        );
+        let mut events = Vec::new();
+        let mut work_stack = Vec::new();
+        tree.apply_transaction(
+            &mut changes,
+            &(),
+            |path, ty| events.push((path, ty)),
+            &mut work_stack,
+            |_| {},
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(p, ty)| *ty == EventType::Modified && p.as_std_path().ends_with("f")),
+            "expected a Modified event for the inner file, got {events:?}",
+        );
+    }
 
     #[test]
     #[should_panic(expected = "NodeId::NONE used as a tree index")]

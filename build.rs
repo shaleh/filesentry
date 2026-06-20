@@ -2,16 +2,19 @@ fn main() {
     // Declare the custom cfg for check-cfg
     println!("cargo::rustc-check-cfg=cfg(watcher_disable)");
 
-    // Disable the watcher if:
-    // 1. We're not on Linux (inotify is Linux-only)
-    // 2. The FILESENTRY_DISABLE environment variable is set (for testing)
-    let disable = !cfg!(target_os = "linux")
-        || std::env::var("FILESENTRY_DISABLE").is_ok();
+    // Gate on the *target* OS (CARGO_CFG_TARGET_OS, not the host — correct under
+    // cross-compilation): inotify (linux), FSEvents (macos), ReadDirectoryChangesW
+    // (windows).
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let supported = matches!(target_os.as_str(), "linux" | "macos" | "windows");
+
+    // Disable the watcher (compile out to the polling fallback) if there is no
+    // backend for this target, or FILESENTRY_DISABLE is set (for testing).
+    let disable = !supported || std::env::var_os("FILESENTRY_DISABLE").is_some();
 
     if disable {
         println!("cargo::rustc-cfg=watcher_disable");
     }
 
-    // Re-run if the environment variable changes
     println!("cargo::rerun-if-env-changed=FILESENTRY_DISABLE");
 }
