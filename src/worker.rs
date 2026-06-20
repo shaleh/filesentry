@@ -1,6 +1,7 @@
 use std::mem::take;
 use std::sync::atomic;
 
+use crate::backend::Backend;
 use crate::pending::PendingChanges;
 use crate::tree::{FileTree, NodeId};
 use crate::{EventDebouncer, Watcher};
@@ -36,11 +37,11 @@ impl Worker {
         if self.events.is_empty() {
             self.watcher
                 .notify
-                .changes
+                .changes()
                 .take(&mut self.pending_changes, || self.watcher.should_wakeup());
             false
         } else {
-            self.watcher.notify.changes.take_timeout(
+            self.watcher.notify.changes().take_timeout(
                 &mut self.pending_changes,
                 self.watcher.state.config.lock().unwrap().settle_time,
                 || self.watcher.should_wakeup(),
@@ -61,7 +62,11 @@ impl Worker {
                     (root.notify)(true);
                     continue;
                 };
-                if let Err(err) = self.watcher.notify.watch_dir(root.path.clone()) {
+                if let Err(err) = self
+                    .watcher
+                    .notify
+                    .watch_dir(root.path.clone(), root.recursive)
+                {
                     log::error!("failed to watch {:?}: {err}", root.path);
                     (root.notify)(false);
                     continue;
@@ -69,7 +74,7 @@ impl Worker {
                 let filter = self.watcher.state.config.lock().unwrap().filter.clone();
                 self.tree
                     .crawl_root(node, root.recursive, &*filter, |path| {
-                        if let Err(err) = self.watcher.notify.watch_dir(path.clone()) {
+                        if let Err(err) = self.watcher.notify.watch_dir(path.clone(), true) {
                             log::error!("failed to watch {path:?}: {err}")
                         }
                     });
@@ -136,7 +141,7 @@ impl Worker {
                         &mut self.work_stack,
                         |path, ty| self.events.add(path, ty),
                         |path| {
-                            if let Err(err) = self.watcher.notify.watch_dir(path.clone()) {
+                            if let Err(err) = self.watcher.notify.watch_dir(path.clone(), true) {
                                 log::error!("failed to watch {path:?}: {err}")
                             }
                         },
@@ -150,7 +155,7 @@ impl Worker {
                 |path, ty| self.events.add(path, ty),
                 &mut self.work_stack,
                 |path| {
-                    if let Err(err) = self.watcher.notify.watch_dir(path.clone()) {
+                    if let Err(err) = self.watcher.notify.watch_dir(path.clone(), true) {
                         log::error!("failed to watch {path:?}: {err}")
                     }
                 },

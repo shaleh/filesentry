@@ -8,6 +8,7 @@ use hashbrown::DefaultHashBuilder;
 use mio::{Poll, Waker};
 use papaya::HashMap;
 
+use crate::backend::Backend;
 use crate::inotify::sys::{Event, EventFlags, Inotify, Watch};
 use crate::path::CanonicalPathBuf;
 use crate::pending::{self, PendingChangesLock};
@@ -34,16 +35,6 @@ impl std::fmt::Debug for InotifyWatcher {
 }
 
 impl InotifyWatcher {
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, atomic::Ordering::Relaxed);
-        let _ = self.waker.wake();
-        self.changes.notify();
-    }
-
-    pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(atomic::Ordering::Relaxed)
-    }
-
     pub fn new(#[cfg(test)] slow: bool, state: Arc<WatcherState>) -> io::Result<Arc<Self>> {
         let mut poll = Poll::new()?;
         let waker = Waker::new(poll.registry(), sys::MESSAGE)?;
@@ -76,16 +67,6 @@ impl InotifyWatcher {
             )
         });
         Ok(watcher)
-    }
-
-    pub fn watch_dir(&self, path: CanonicalPathBuf) -> io::Result<()> {
-        let watch = self.notify.add_directory_watch(&*path)?;
-        self.watches.pin().insert(watch, path);
-        Ok(())
-    }
-
-    pub fn refresh_config(&self) {
-        let _ = self.waker.wake();
     }
 
     fn handle_event(&self, event: Event, filter: &dyn Filter) {
@@ -142,5 +123,31 @@ impl InotifyWatcher {
                 pending.add_watcher(path, /* timestamp, */ pending::Flags::empty());
             }
         }
+    }
+}
+
+impl crate::backend::Backend for InotifyWatcher {
+    fn changes(&self) -> &PendingChangesLock {
+        &self.changes
+    }
+
+    fn watch_dir(&self, path: CanonicalPathBuf, _recursive: bool) -> io::Result<()> {
+        let watch = self.notify.add_directory_watch(&*path)?;
+        self.watches.pin().insert(watch, path);
+        Ok(())
+    }
+
+    fn shutdown(&self) {
+        self.shutdown.store(true, atomic::Ordering::Relaxed);
+        let _ = self.waker.wake();
+        self.changes.notify();
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(atomic::Ordering::Relaxed)
+    }
+
+    fn refresh_config(&self) {
+        let _ = self.waker.wake();
     }
 }

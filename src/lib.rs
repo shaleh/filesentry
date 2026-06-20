@@ -14,8 +14,6 @@ use crate::config::Config;
 #[cfg(not(watcher_disable))]
 use crate::events::EventDebouncer;
 pub use crate::events::{Event, EventType, Events};
-#[cfg(not(watcher_disable))]
-use crate::inotify::InotifyWatcher;
 pub use crate::path::{CannonicalPath, CanonicalPathBuf};
 pub use config::Filter;
 
@@ -26,6 +24,10 @@ mod path;
 
 // These modules require the full Watcher implementation
 #[cfg(not(watcher_disable))]
+mod backend;
+#[cfg(all(not(watcher_disable), target_os = "macos"))]
+mod fsevent;
+#[cfg(all(not(watcher_disable), target_os = "linux"))]
 mod inotify;
 #[cfg(not(watcher_disable))]
 mod pending;
@@ -70,7 +72,7 @@ struct WatcherState {
 
 #[cfg(not(watcher_disable))]
 pub struct ShutdownOnDrop {
-    watcher: Weak<InotifyWatcher>,
+    watcher: Weak<NativeBackend>,
 }
 
 #[cfg(not(watcher_disable))]
@@ -102,7 +104,7 @@ impl ShutdownOnDrop {
 #[derive(Debug, Clone)]
 pub struct Watcher {
     state: Arc<WatcherState>,
-    notify: Arc<InotifyWatcher>,
+    notify: Arc<NativeBackend>,
 }
 
 #[cfg(not(watcher_disable))]
@@ -154,7 +156,7 @@ impl Watcher {
         self.state
             .has_notifications
             .store(true, atomic::Ordering::Relaxed);
-        self.notify.changes.notify();
+        self.notify.changes().notify();
         Ok(())
     }
 
@@ -162,8 +164,8 @@ impl Watcher {
         self.state.config.lock().unwrap().filter = filter;
         self.notify.refresh_config();
         if recrawl {
-            self.notify.changes.lock().recrawl();
-            self.notify.changes.notify();
+            self.notify.changes().lock().recrawl();
+            self.notify.changes().notify();
         }
     }
 
@@ -197,9 +199,9 @@ impl Watcher {
             recrawls: AtomicUsize::new(0),
         });
         #[cfg(test)]
-        let watcher = InotifyWatcher::new(_slow, state.clone())?;
+        let watcher = NativeBackend::new(_slow, state.clone())?;
         #[cfg(not(test))]
-        let watcher = InotifyWatcher::new(state.clone())?;
+        let watcher = NativeBackend::new(state.clone())?;
 
         Ok(Self {
             state,
