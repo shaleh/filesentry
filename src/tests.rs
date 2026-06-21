@@ -41,7 +41,7 @@ impl Assertion {
     ) -> Assertion {
         let mut expected: Vec<_> = expected
             .into_iter()
-            .map(|(path, event)| (dir.join(path), event))
+            .map(|(path, event)| (sub(dir, path), event))
             .collect();
         expected.sort_unstable();
         let state: Arc<Mutex<_>> = Arc::default();
@@ -89,21 +89,26 @@ impl Assertion {
 }
 
 fn rm_dir(dst: &Path, path: &str) {
-    fs::remove_dir(dst.join(path)).unwrap();
+    fs::remove_dir(sub(dst, path)).unwrap();
 }
 
 fn rm_file(dst: &Path, path: &str) {
-    fs::remove_file(dst.join(path)).unwrap();
+    fs::remove_file(sub(dst, path)).unwrap();
 }
 
 fn write(dst: &Path, path: &str, content: &str) {
-    fs::write(dst.join(path), content).unwrap();
+    fs::write(sub(dst, path), content).unwrap();
 }
 
 fn mk_write(dst: &Path, path: &str, content: &str) {
-    let path = dst.join(path);
+    let path = sub(dst, path);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
+}
+
+// Rewrite separator to make assertions compatible across OSes.
+fn sub(base: &Path, rel: &str) -> PathBuf {
+    base.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR))
 }
 
 fn init_watcher() -> (TempDir, Watcher) {
