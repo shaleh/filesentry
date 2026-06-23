@@ -305,6 +305,17 @@ impl FileTree {
                 let meta = NodeMeta::new(&fs_meta);
                 let id = NodeId::from(self.nodes.len());
                 entry.insert(id);
+                // Materialize the node before resolving its parent. The parent
+                // lookup runs its comparison over every entry that collides in
+                // the table, so it can land on the id we just inserted. Reading
+                // the node array for that id would panic before the node exists.
+                self.nodes.push(FsNode {
+                    path: change.path.clone(),
+                    meta,
+                    flags: Flags::empty(),
+                    inode: fs_meta.inode,
+                    children: DirId::NONE,
+                });
                 let parent = change.path.parent().and_then(|parent| {
                     let hash = self.hasher.hash_one(parent.as_os_str());
                     self.path_table
@@ -313,27 +324,19 @@ impl FileTree {
                 });
                 let Some(parent) = parent else {
                     log::error!("for {change:?} the parent wasn't yet in the tree! Ignoring...");
-                    // remove inserted entry again as insertion failed
+                    // remove the inserted entry and node again as insertion failed
                     self.path_table
                         .find_entry(hash, |&tree_id| tree_id == id)
                         .unwrap()
                         .remove();
+                    self.nodes.pop();
                     return (NodeId::NONE, true);
                 };
                 self.add_child(parent, id);
                 recursive = mark_recursive || self[parent].flags.contains(Flags::RECURSIVE);
-                let flags = if recursive {
-                    Flags::RECURSIVE
-                } else {
-                    Flags::empty()
-                };
-                self.nodes.push(FsNode {
-                    path: change.path.clone(),
-                    meta,
-                    flags,
-                    inode: fs_meta.inode,
-                    children: DirId::NONE,
-                });
+                if recursive {
+                    self.nodes[id.idx()].flags = Flags::RECURSIVE;
+                }
                 if !fs_meta.is_dir {
                     emit_event(change.path.clone(), EventType::Create)
                 } else if recursive && fs_meta.size != 0 {
